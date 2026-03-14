@@ -275,8 +275,10 @@ impl XdpDispatcher {
             let link_fd: FdLink = link_o.try_into().map_err(|_link_err| Error::NoFdLink)?;
             link_fd.pin(&new_link_pin)?;
         } else {
-            let attach_flags = xdp_flags | XdpFlags::UPDATE_IF_NOEXIST;
-            match dispatcher_xdp.attach_to_if_index(if_index, attach_flags) {
+            // Don't add UPDATE_IF_NOEXIST: it is a netlink-specific flag that
+            // causes bpf_link_create to reject the request with EINVAL.
+            // BPF link-based XDP already returns EEXIST on conflict.
+            match dispatcher_xdp.attach_to_if_index(if_index, xdp_flags) {
                 Ok(link_id) => {
                     let link_o = dispatcher_xdp.take_link(link_id)?;
                     let link_fd: FdLink = link_o.try_into().map_err(|_link_err| Error::NoFdLink)?;
