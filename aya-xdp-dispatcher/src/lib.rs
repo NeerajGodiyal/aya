@@ -27,6 +27,18 @@ const AYA_XDP_DISPATCHER_EBPF_PROGRAM: &[u8] =
 
 const RTDIR_FS_XDP: &str = "/sys/fs/bpf/xdp";
 
+// Config is stored on a regular filesystem because bpffs does not support
+// creating regular files (only BPF objects via BPF_OBJ_PIN). The dispatcher
+// directory name links the two locations.
+const RTDIR_CONFIG_XDP: &str = "/run/aya-xdp";
+
+fn config_dir_for(dispatcher_dir: &Path) -> PathBuf {
+    let dir_name = dispatcher_dir
+        .file_name()
+        .expect("dispatcher_dir must have a directory name");
+    PathBuf::from(RTDIR_CONFIG_XDP).join(dir_name)
+}
+
 pub const MAX_PROGRAMS: usize = MAX_DISPATCHER_ACTIONS;
 
 pub const DEFAULT_PRIORITY: u32 = 50;
@@ -133,13 +145,16 @@ impl XdpDispatcher {
     }
 
     fn read_config(dispatcher_dir: &Path) -> Result<XdpDispatcherConfig> {
-        let bytes = fs::read(dispatcher_dir.join("config"))?;
+        let cfg_dir = config_dir_for(dispatcher_dir);
+        let bytes = fs::read(cfg_dir.join("config"))?;
         try_pod_read_unaligned(&bytes).map_err(|_pod| Error::InvalidConfig)
     }
 
     fn write_config(dispatcher_dir: &Path, config: &XdpDispatcherConfig) -> Result<()> {
+        let cfg_dir = config_dir_for(dispatcher_dir);
+        fs::create_dir_all(&cfg_dir)?;
         let bytes = bytemuck::bytes_of(config);
-        fs::write(dispatcher_dir.join("config"), bytes)?;
+        fs::write(cfg_dir.join("config"), bytes)?;
         Ok(())
     }
 
@@ -341,6 +356,7 @@ impl XdpDispatcher {
             ) {
                 Ok(ids) => {
                     if let Some(old_dir) = existing_dir.as_ref() {
+                        drop(fs::remove_dir_all(config_dir_for(old_dir)));
                         drop(fs::remove_dir_all(old_dir));
                     }
                     break ids;
@@ -394,6 +410,7 @@ impl XdpDispatcher {
                 drop(PinnedLink::from_pin(&link_pin));
                 drop(fs::remove_file(&link_pin));
             }
+            drop(fs::remove_dir_all(config_dir_for(&existing_dir)));
             drop(fs::remove_dir_all(&existing_dir));
             return Ok(());
         }
@@ -406,6 +423,7 @@ impl XdpDispatcher {
             &mut no_ebpfs,
             Some(&existing_dir),
         )?;
+        drop(fs::remove_dir_all(config_dir_for(&existing_dir)));
         fs::remove_dir_all(&existing_dir)?;
         Ok(())
     }
@@ -434,6 +452,7 @@ impl FolderFailureGuard<'_> {
 
 impl Drop for FolderFailureGuard<'_> {
     fn drop(&mut self) {
+        drop(fs::remove_dir_all(config_dir_for(self.0)));
         if let Err(e) = fs::remove_dir_all(self.0) {
             log::error!(
                 "aya-xdp-dispatcher: failed to remove directory {}: {e}",
