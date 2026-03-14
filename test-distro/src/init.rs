@@ -140,18 +140,15 @@ fn run() -> anyhow::Result<()> {
     // here (as PID 1 with full capabilities) because bpffs mkdir requires
     // CAP_BPF + CAP_NET_ADMIN which may not survive execve to child processes
     // on newer kernels.
-    nix::unistd::mkdir(
-        "/sys/fs/bpf/xdp",
-        nix::sys::stat::Mode::all(),
-    )
-    .or_else(|err| {
-        if err == nix::errno::Errno::EEXIST {
-            Ok(())
-        } else {
-            Err(err)
-        }
-    })
-    .context("mkdir(/sys/fs/bpf/xdp) failed")?;
+    nix::unistd::mkdir("/sys/fs/bpf/xdp", nix::sys::stat::Mode::all())
+        .or_else(|err| {
+            if err == nix::errno::Errno::EEXIST {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        })
+        .context("mkdir(/sys/fs/bpf/xdp) failed")?;
 
     // By contract we run everything in /bin and assume they're rust test binaries.
     //
