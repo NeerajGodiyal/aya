@@ -259,7 +259,11 @@ impl XdpDispatcher {
                 prog_id
             };
 
-            ext_prog_ids.push(ext_prog_id);
+            // Only track newly loaded programs as owned. Re-pinned existing
+            // programs belong to their original dispatcher instance.
+            if slot.existing_prog_path.is_none() {
+                ext_prog_ids.push(ext_prog_id);
+            }
         }
 
         Self::write_config(&new_dir, &config)?;
