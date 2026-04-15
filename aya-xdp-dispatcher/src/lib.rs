@@ -8,8 +8,9 @@ use std::{
 
 use aya::{
     Ebpf, EbpfLoader, include_bytes_aligned,
+    maps::{Array, Map, MapData},
     programs::{
-        Extension, Xdp, XdpFlags,
+        Extension, ProgramInfo, Xdp, XdpFlags,
         links::{FdLink, PinnedLink},
     },
 };
@@ -17,7 +18,6 @@ use aya_xdp_dispatcher_ebpf::{
     MAX_DISPATCHER_ACTIONS, XDP_DISPATCHER_MAGIC, XDP_DISPATCHER_RETVAL, XDP_DISPATCHER_VERSION,
     XdpDispatcherConfig,
 };
-use bytemuck::try_pod_read_unaligned;
 pub use error::{Error, Result};
 use nix::fcntl::{Flock, FlockArg};
 use uuid::Uuid;
@@ -26,18 +26,6 @@ const AYA_XDP_DISPATCHER_EBPF_PROGRAM: &[u8] =
     include_bytes_aligned!(concat!(env!("OUT_DIR"), "/aya-xdp-dispatcher-ebpf"));
 
 const RTDIR_FS_XDP: &str = "/sys/fs/bpf/xdp";
-
-// Config is stored on a regular filesystem because bpffs does not support
-// creating regular files (only BPF objects via BPF_OBJ_PIN). The dispatcher
-// directory name links the two locations.
-const RTDIR_CONFIG_XDP: &str = "/run/aya-xdp";
-
-fn config_dir_for(dispatcher_dir: &Path) -> PathBuf {
-    let dir_name = dispatcher_dir
-        .file_name()
-        .expect("dispatcher_dir must have a directory name");
-    PathBuf::from(RTDIR_CONFIG_XDP).join(dir_name)
-}
 
 pub const MAX_PROGRAMS: usize = MAX_DISPATCHER_ACTIONS;
 
@@ -144,18 +132,26 @@ impl XdpDispatcher {
         Ok(None)
     }
 
+    // Read the dispatcher config from the `.rodata` BPF map, following the
+    // libxdp approach for discovering existing dispatchers.
+    //
+    // The config is embedded in the dispatcher's `.rodata` section at load time
+    // via `override_global`. The kernel stores it as a frozen `BPF_MAP_TYPE_ARRAY`
+    // map. We discover it by reading the pinned dispatcher program's `map_ids`,
+    // then reading the first (and only) map's value.
     fn read_config(dispatcher_dir: &Path) -> Result<XdpDispatcherConfig> {
-        let cfg_dir = config_dir_for(dispatcher_dir);
-        let bytes = fs::read(cfg_dir.join("config"))?;
-        try_pod_read_unaligned(&bytes).map_err(|_pod| Error::InvalidConfig)
-    }
-
-    fn write_config(dispatcher_dir: &Path, config: &XdpDispatcherConfig) -> Result<()> {
-        let cfg_dir = config_dir_for(dispatcher_dir);
-        fs::create_dir_all(&cfg_dir)?;
-        let bytes = bytemuck::bytes_of(config);
-        fs::write(cfg_dir.join("config"), bytes)?;
-        Ok(())
+        let prog_info = ProgramInfo::from_pin(dispatcher_dir.join("dispatcher"))
+            .map_err(|_e| Error::InvalidConfig)?;
+        let map_ids = prog_info
+            .map_ids()
+            .map_err(|_e| Error::InvalidConfig)?
+            .ok_or(Error::InvalidConfig)?;
+        let &map_id = map_ids.first().ok_or(Error::InvalidConfig)?;
+        let map_data = MapData::from_id(map_id).map_err(|_e| Error::InvalidConfig)?;
+        let arr: Array<MapData, XdpDispatcherConfig> = Map::Array(map_data)
+            .try_into()
+            .map_err(|_e| Error::InvalidConfig)?;
+        arr.get(&0, 0).map_err(|_e| Error::InvalidConfig)
     }
 
     fn read_existing_slots(dispatcher_dir: &Path, config: &XdpDispatcherConfig) -> Vec<SlotEntry> {
@@ -176,7 +172,7 @@ impl XdpDispatcher {
 
     /// Core loader: build a new dispatcher with `slots`, pin everything in bpffs, then attach.
     ///
-    /// On success returns `(new_dispatcher_dir, ext_prog_ids)`.
+    /// On success returns `ext_prog_ids` of newly loaded programs.
     /// On concurrent-modification the caller should retry.
     fn do_load(
         if_index: u32,
@@ -211,6 +207,10 @@ impl XdpDispatcher {
             program_flags,
         };
 
+        // The config is embedded in the dispatcher's .rodata section via
+        // override_global. After loading, the kernel creates a frozen
+        // BPF_MAP_TYPE_ARRAY map for .rodata that can be read back via
+        // bpf_map_lookup_elem — no separate config file needed.
         let mut dispatcher_bpf = EbpfLoader::new()
             .override_global("conf", &config, true)
             .load(AYA_XDP_DISPATCHER_EBPF_PROGRAM)?;
@@ -228,6 +228,10 @@ impl XdpDispatcher {
         let new_dir = PathBuf::from(RTDIR_FS_XDP).join(format!("dispatch-{if_index}-{did}"));
         fs::create_dir_all(&new_dir)?;
         let rtdir_guard = FolderFailureGuard(&new_dir);
+
+        // Pin the dispatcher program so its .rodata map is discoverable
+        // via ProgramInfo::from_pin -> map_ids -> MapData::from_id.
+        dispatcher_xdp.pin(new_dir.join("dispatcher"))?;
 
         let mut ext_prog_ids: Vec<u32> = Vec::new();
         for (i, slot) in slots.iter_mut().enumerate() {
@@ -265,8 +269,6 @@ impl XdpDispatcher {
                 ext_prog_ids.push(ext_prog_id);
             }
         }
-
-        Self::write_config(&new_dir, &config)?;
 
         let new_link_pin = new_dir.join("link");
         if let Some(existing_dir) = existing_dir {
@@ -362,7 +364,6 @@ impl XdpDispatcher {
             ) {
                 Ok(ids) => {
                     if let Some(old_dir) = existing_dir.as_ref() {
-                        drop(fs::remove_dir_all(config_dir_for(old_dir)));
                         drop(fs::remove_dir_all(old_dir));
                     }
                     break ids;
@@ -403,7 +404,7 @@ impl XdpDispatcher {
                 let Some(path) = slot.existing_prog_path.as_ref() else {
                     return true;
                 };
-                let id = aya::programs::ProgramInfo::from_pin(path).map_or(0, |info| info.id());
+                let id = ProgramInfo::from_pin(path).map_or(0, |info| info.id());
                 !self.owned_prog_ids.contains(&id)
             })
             .collect();
@@ -411,12 +412,9 @@ impl XdpDispatcher {
         if remaining.is_empty() {
             let link_pin = existing_dir.join("link");
             if link_pin.exists() {
-                // Opening the pin keeps the link alive during our cleanup
-                // the PinnedLink decrements its reference count and detaches.
                 drop(PinnedLink::from_pin(&link_pin));
                 drop(fs::remove_file(&link_pin));
             }
-            drop(fs::remove_dir_all(config_dir_for(&existing_dir)));
             drop(fs::remove_dir_all(&existing_dir));
             return Ok(());
         }
@@ -429,7 +427,6 @@ impl XdpDispatcher {
             &mut no_ebpfs,
             Some(&existing_dir),
         )?;
-        drop(fs::remove_dir_all(config_dir_for(&existing_dir)));
         fs::remove_dir_all(&existing_dir)?;
         Ok(())
     }
@@ -458,7 +455,6 @@ impl FolderFailureGuard<'_> {
 
 impl Drop for FolderFailureGuard<'_> {
     fn drop(&mut self) {
-        drop(fs::remove_dir_all(config_dir_for(self.0)));
         if let Err(e) = fs::remove_dir_all(self.0) {
             log::error!(
                 "aya-xdp-dispatcher: failed to remove directory {}: {e}",

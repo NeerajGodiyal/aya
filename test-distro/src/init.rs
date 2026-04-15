@@ -74,14 +74,6 @@ fn run() -> anyhow::Result<()> {
             target_mode: Some(nix::sys::stat::Mode::all()),
         },
         Mount {
-            source: "tmpfs",
-            target: "/run",
-            fstype: "tmpfs",
-            flags: nix::mount::MsFlags::empty(),
-            data: None,
-            target_mode: Some(RXRXRX),
-        },
-        Mount {
             source: "sysfs",
             target: "/sys",
             fstype: "sysfs",
